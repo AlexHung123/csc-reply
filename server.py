@@ -21,10 +21,13 @@ import secrets
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
 
 HOST = "0.0.0.0"
 PORT = 8091
+ROOT = Path(__file__).resolve().parent
+LOGO_FILE = ROOT / "static" / "logo.svg"
 IDLE_KEEP_S = 10 * 60
 MAX_BODY = 256_000
 MAX_TEXT = 100_000
@@ -37,6 +40,7 @@ TYPE_SCALES = {"small", "medium", "large"}
 
 lock = threading.Lock()
 sessions: dict[str, "Session"] = {}
+gates: dict[str, tuple[str, str]] = {}
 
 
 class Session:
@@ -133,10 +137,24 @@ def same_secret(left: str, right: str) -> bool:
 
 
 def apply_passcode(session: Session, code: str | None) -> None:
-    if code is None or code == session.passcode:
+    if code is None:
+        return
+    changed = code != session.passcode
+    if not changed and gates.get(session.room) == (session.passcode, session.grant):
         return
     session.passcode = code
-    session.grant = secrets.token_urlsafe(18) if code else ""
+    if not code:
+        session.grant = ""
+        gates.pop(session.room, None)
+    else:
+        stored = gates.get(session.room)
+        if stored is not None and stored[0] == code:
+            session.grant = stored[1]
+        else:
+            session.grant = secrets.token_urlsafe(18)
+        gates[session.room] = (code, session.grant)
+    if not changed:
+        return
     for watcher in session.watchers:
         try:
             watcher.put_nowait(None)
@@ -167,20 +185,37 @@ def new_room() -> str:
             return room
 
 
+def notify(watcher: queue.Queue, payload: str | None) -> None:
+    try:
+        watcher.put_nowait(payload)
+        return
+    except queue.Full:
+        pass
+    try:
+        watcher.get_nowait()
+    except queue.Empty:
+        pass
+    try:
+        watcher.put_nowait(payload)
+    except queue.Full:
+        pass
+
+
 def publish(session: Session) -> None:
     payload = json.dumps(session.public(), ensure_ascii=False, separators=(",", ":"))
     for watcher in list(session.watchers):
-        try:
-            watcher.put_nowait(payload)
-        except queue.Full:
-            try:
-                watcher.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                watcher.put_nowait(payload)
-            except queue.Full:
-                pass
+        notify(watcher, payload)
+
+
+def retire(session: Session) -> None:
+    """Drop a stopped room so the watch page can no longer enter it."""
+    sessions.pop(session.room, None)
+    note = json.dumps({"phase": "idle"}, separators=(",", ":"))
+    for watcher in list(session.watchers):
+        notify(watcher, note)
+        notify(watcher, None)
+    session.watchers.clear()
+    print(f"closed {session.room}", flush=True)
 
 
 def drop_expired() -> None:
@@ -217,10 +252,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health" or path == "/":
             self.send_json({"ok": True, "service": "csc-relay"})
             return
-        if path.startswith("/watch/"):
-            room = canonical_room(path.removeprefix("/watch/"))
+        if path == "/logo.svg":
+            self.send_file(LOGO_FILE, "image/svg+xml")
+            return
+        if path == "/watch" or path.startswith("/watch/"):
+            room = canonical_room(path.removeprefix("/watch/")) if path.startswith("/watch/") else None
             if room is None:
-                self.send_error_json(404, "not found")
+                self.send_html(MISSING_HTML, status=404)
                 return
             self.send_html(WATCH_HTML)
             return
@@ -292,19 +330,33 @@ class Handler(BaseHTTPRequestHandler):
             if room is None:
                 room = new_room()
             session = sessions.get(room)
-            if session is None:
-                session = Session(room, state)
-                sessions[room] = session
-                print(f"created {room}", flush=True)
+            if session is not None and state.get("phase") == "idle" and session.state.get("phase") != "idle":
+                apply_passcode(session, passcode)
+                session.touch()
+                publish(session)
+                body = session.public()
+                closed = False
             else:
-                session.state = state
-                print(f"reused {room}", flush=True)
-            apply_passcode(session, passcode)
-            session.touch()
-            publish(session)
-            body = session.public()
-        host = self.headers.get("Host") or f"127.0.0.1:{PORT}"
-        body["watchUrl"] = f"http://{host}/watch/{room}"
+                if session is None:
+                    session = Session(room, state)
+                    sessions[room] = session
+                    print(f"created {room}", flush=True)
+                else:
+                    session.state = state
+                    print(f"reused {room}", flush=True)
+                apply_passcode(session, passcode)
+                if session.state.get("phase") == "idle":
+                    retire(session)
+                    closed = True
+                    body = {"ok": True, "id": room, "phase": "idle"}
+                else:
+                    session.touch()
+                    publish(session)
+                    body = session.public()
+                    closed = False
+        if not closed:
+            host = self.headers.get("Host") or f"127.0.0.1:{PORT}"
+            body["watchUrl"] = f"http://{host}/watch/{room}"
         self.send_json(body, status=201)
 
     def update_session(self, room: str, patch: dict) -> None:
@@ -324,9 +376,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error_json(400, str(error))
                 return
             apply_passcode(session, passcode)
-            session.touch()
-            body = session.public()
-            publish(session)
+            if session.state.get("phase") == "idle":
+                retire(session)
+                body = {"ok": True, "id": room, "phase": "idle"}
+            else:
+                session.touch()
+                publish(session)
+                body = session.public()
         self.send_json(body)
 
     def join_session(self, room: str, patch: dict) -> None:
@@ -337,14 +393,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         with lock:
             session = sessions.get(room)
+            if session is not None and session.state.get("phase") == "idle":
+                retire(session)
+                session = None
             if session is None:
-                self.send_error_json(404, "session not found")
-                return
-            if session.passcode and not same_secret(code, session.passcode):
+                stored = gates.get(room)
+                if stored is None or not stored[0]:
+                    self.send_error_json(404, "session not found")
+                    return
+                if not same_secret(code, stored[0]):
+                    self.send_json({"locked": True}, status=401)
+                    return
+                grant = stored[1]
+                locked = True
+            elif session.passcode and not same_secret(code, session.passcode):
                 self.send_json({"locked": True}, status=401)
                 return
-            grant = session.grant
-            locked = bool(session.passcode)
+            else:
+                grant = session.grant
+                locked = bool(session.passcode)
         if locked:
             self.send_empty(
                 204,
@@ -356,8 +423,11 @@ class Handler(BaseHTTPRequestHandler):
     def send_session(self, room: str) -> None:
         with lock:
             session = sessions.get(room)
+            if session is not None and session.state.get("phase") == "idle":
+                retire(session)
+                session = None
             if session is None:
-                self.send_error_json(404, "session not found")
+                self.send_gate_or_missing(room)
                 return
             if not self.viewer_allowed(session):
                 self.send_json({"locked": True}, status=401)
@@ -369,8 +439,11 @@ class Handler(BaseHTTPRequestHandler):
         watcher: queue.Queue = queue.Queue(maxsize=32)
         with lock:
             session = sessions.get(room)
+            if session is not None and session.state.get("phase") == "idle":
+                retire(session)
+                session = None
             if session is None:
-                self.send_error_json(404, "session not found")
+                self.send_gate_or_missing(room)
                 return
             if not self.viewer_allowed(session):
                 self.send_json({"locked": True}, status=401)
@@ -404,6 +477,25 @@ class Handler(BaseHTTPRequestHandler):
                 current = sessions.get(room)
                 if current is not None and watcher in current.watchers:
                     current.watchers.remove(watcher)
+
+    def send_gate_or_missing(self, room: str) -> None:
+        stored = gates.get(room)
+        if stored is None or not stored[0]:
+            self.send_error_json(404, "session not found")
+            return
+        token = self.cookies().get(f"csc_{room}", "")
+        if not stored[1] or not same_secret(token, stored[1]):
+            self.send_json({"locked": True}, status=401)
+            return
+        body = default_state()
+        body["phase"] = "idle"
+        body["status"] = ""
+        body["sourceText"] = ""
+        body["targetText"] = ""
+        body["paused"] = False
+        body["id"] = room
+        body["updatedAt"] = int(time.time() * 1000)
+        self.send_json(body)
 
     def viewer_allowed(self, session: Session) -> bool:
         if not session.passcode:
@@ -454,9 +546,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def send_html(self, html: str) -> None:
-        raw = html.encode()
+    def send_file(self, path: Path, content_type: str) -> None:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            self.send_error_json(404, "not found")
+            return
         self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def send_html(self, html: str, status: int = 200) -> None:
+        raw = html.encode()
+        self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
@@ -467,18 +572,97 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": message}, status=status)
 
 
-WATCH_HTML = """<!DOCTYPE html>
-<html lang="zh-Hans">
+MISSING_HTML = """<!DOCTYPE html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CSC Translate</title>
+<title>CSC - Translate</title>
+<link rel="icon" href="/logo.svg">
 <style>
   :root {
     --ink: #111111;
-    --mute: #9ca3af;
-    --pane: #f3f4f6;
-    --line: #e6e6e6;
+    --mute: #8a8178;
+    --line: rgba(90, 62, 40, 0.12);
+    --cream: #fefbf3;
+    --band: #fdf4e9;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex;
+    color: var(--ink);
+    background-color: var(--cream);
+    background-image: repeating-linear-gradient(
+      45deg,
+      var(--band) 0 200px,
+      var(--cream) 200px 780px
+    );
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", sans-serif;
+  }
+  body::before {
+    content: "";
+    position: fixed;
+    z-index: 1;
+    top: 0;
+    right: 0;
+    width: 64px;
+    height: 64px;
+    background: linear-gradient(to bottom left, #fdf5eb 50%, transparent 50%);
+    pointer-events: none;
+  }
+  main {
+    position: relative;
+    z-index: 2;
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .notice {
+    width: min(420px, 100%);
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 14px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .logo { height: 36px; width: auto; display: block; }
+  .brand-name { font-size: 16px; font-weight: 600; letter-spacing: 0.01em; }
+  h1 { margin: 8px 0 0; font-size: 22px; font-weight: 600; }
+  p { margin: 0; color: var(--mute); font-size: 16px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<main>
+  <div class="notice">
+    <div class="brand">
+      <img class="logo" src="/logo.svg" alt="">
+      <span class="brand-name">CSC - Translate</span>
+    </div>
+    <h1>Meeting not found</h1>
+    <p>This meeting ID does not exist. Check the link and try again.</p>
+  </div>
+</main>
+</body>
+</html>
+"""
+
+WATCH_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSC - Translate</title>
+<link rel="icon" href="/logo.svg">
+<style>
+  :root {
+    --ink: #111111;
+    --mute: #8a8178;
+    --line: rgba(90, 62, 40, 0.12);
+    --cream: #fefbf3;
+    --band: #fdf4e9;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -486,25 +670,89 @@ WATCH_HTML = """<!DOCTYPE html>
     display: flex;
     flex-direction: column;
     color: var(--ink);
-    background: #fff;
+    background-color: var(--cream);
+    background-image: repeating-linear-gradient(
+      45deg,
+      var(--band) 0 200px,
+      var(--cream) 200px 780px
+    );
     font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", sans-serif;
   }
+  body::before {
+    content: "";
+    position: fixed;
+    z-index: 3;
+    top: 0;
+    right: 0;
+    width: 64px;
+    height: 64px;
+    background: linear-gradient(to bottom left, #fdf5eb 50%, transparent 50%);
+    pointer-events: none;
+  }
   header {
+    position: relative;
+    z-index: 1;
     display: flex;
     align-items: center;
-    gap: 10px;
-    height: 56px;
-    padding: 0 20px;
+    gap: 12px;
+    height: 68px;
+    padding: 0 76px 0 20px;
     border-bottom: 1px solid var(--line);
     font-size: 16px;
     font-weight: 500;
   }
-  header .arrow { color: var(--mute); }
-  header .phase { margin-left: auto; color: var(--mute); font-size: 14px; font-weight: 400; }
-  main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .brand, .lock-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 0 0 auto;
+    min-width: 0;
+  }
+  .logo { height: 36px; width: auto; display: block; }
+  .brand-name, .lock-name {
+    color: var(--ink);
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+  }
+  .brand-name { font-size: 16px; }
+  .lock-brand { margin-bottom: 8px; }
+  .lock-name { font-size: 22px; }
+  @media (max-width: 720px) {
+    body::before { width: 44px; height: 44px; }
+    header { height: 58px; gap: 8px; padding: 0 52px 0 12px; font-size: 14px; }
+    .logo { height: 30px; }
+    .brand-name { font-size: 14px; }
+    .brand, .lock-brand { gap: 8px; }
+  }
+  .tabs { display: flex; align-items: center; gap: 4px; min-width: 0; }
+  .tab {
+    font: inherit;
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--mute);
+    background: transparent;
+    border: 0;
+    border-radius: 999px;
+    padding: 6px 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .tab.on {
+    color: var(--ink);
+    background: rgba(255, 255, 255, 0.78);
+    box-shadow: inset 0 0 0 1px var(--line);
+  }
+  header .phase { margin-left: auto; color: var(--mute); font-size: 14px; font-weight: 400; white-space: nowrap; }
+  @media (max-width: 720px) {
+    header { height: auto; flex-wrap: wrap; padding: 8px 48px 8px 12px; }
+    .tabs { flex: 1 0 100%; }
+    .tab { font-size: 14px; padding: 6px 10px; }
+  }
+  main { position: relative; z-index: 1; flex: 1; display: flex; flex-direction: column; min-height: 0; }
   section { flex: 1; display: flex; flex-direction: column; min-height: 0; padding: 12px 20px; }
-  section.pane { background: var(--pane); }
-  body.translation #sourcePane, body.source #targetPane { display: none; }
+  section[hidden] { display: none; }
+  body.view-pair section + section { box-shadow: inset 0 1px 0 var(--line); }
   .lang, .status { color: var(--mute); font-size: 14px; }
   .text {
     flex: 1;
@@ -512,6 +760,23 @@ WATCH_HTML = """<!DOCTYPE html>
     margin-top: 12px;
     white-space: pre-wrap;
     word-break: break-word;
+    color: #111111;
+  }
+  .text .dim { color: #8a9099; }
+  .text .caret {
+    display: inline-block;
+    width: 0.12em;
+    min-width: 2px;
+    height: 0.92em;
+    margin-left: 0.06em;
+    background: #111111;
+    vertical-align: text-bottom;
+    animation: caret-blink 1.06s linear infinite;
+  }
+  .text.settled .caret { display: none; }
+  @keyframes caret-blink {
+    0%, 49% { opacity: 1; }
+    50%, 100% { opacity: 0; }
   }
   body.small .text { font-size: 18px; line-height: 28px; }
   body.medium .text { font-size: 22px; line-height: 34px; }
@@ -523,11 +788,17 @@ WATCH_HTML = """<!DOCTYPE html>
   }
   .lock {
     position: fixed;
+    z-index: 2;
     inset: 0;
     display: flex;
     align-items: center;
     justify-content: center;
-    background: #fff;
+    background-color: var(--cream);
+    background-image: repeating-linear-gradient(
+      45deg,
+      var(--band) 0 200px,
+      var(--cream) 200px 780px
+    );
   }
   .lock[hidden] { display: none; }
   .lock form {
@@ -556,11 +827,17 @@ WATCH_HTML = """<!DOCTYPE html>
   .lock .error { min-height: 20px; color: #ff3b30; font-size: 14px; }
 </style>
 </head>
-<body class="medium split">
+<body class="medium view-en">
 <header>
-  <span id="sourceLabel">English</span>
-  <span class="arrow">→</span>
-  <span id="targetLabel">Chinese</span>
+  <div class="brand">
+    <img class="logo" src="/logo.svg" alt="">
+    <span class="brand-name">CSC - Translate</span>
+  </div>
+  <nav class="tabs" id="tabs">
+    <button type="button" class="tab on" data-tab="en">English</button>
+    <button type="button" class="tab" data-tab="zh">Chinese</button>
+    <button type="button" class="tab" data-tab="pair" id="pairTab">English → Chinese</button>
+  </nav>
   <span id="phase" class="phase"></span>
 </header>
 <main>
@@ -569,7 +846,7 @@ WATCH_HTML = """<!DOCTYPE html>
     <div class="text" id="sourceText"></div>
     <div class="status" id="sourceStatus"></div>
   </section>
-  <section id="targetPane" class="pane">
+  <section id="targetPane" hidden>
     <div class="lang" id="targetLang">Chinese</div>
     <div class="text" id="targetText"></div>
     <div class="status" id="targetStatus"></div>
@@ -577,6 +854,10 @@ WATCH_HTML = """<!DOCTYPE html>
 </main>
 <div id="lock" class="lock" hidden>
   <form id="lockForm">
+    <div class="lock-brand">
+      <img class="logo" src="/logo.svg" alt="">
+      <span class="lock-name">CSC Translate</span>
+    </div>
     <label for="code">Passcode</label>
     <input id="code" autocomplete="off" autocapitalize="off" spellcheck="false">
     <button type="submit">Enter</button>
@@ -585,10 +866,218 @@ WATCH_HTML = """<!DOCTYPE html>
 </div>
 <script>
 const room = location.pathname.split("/").filter(Boolean).pop();
+let tab = "en";
+let direction = "en-zh";
+let scale = "medium";
 
-function labels(direction) {
-  return direction === "zh-en" ? ["Chinese", "English"] : ["English", "Chinese"];
+function labels(next) {
+  return next === "zh-en" ? ["Chinese", "English"] : ["English", "Chinese"];
 }
+
+function showTab() {
+  const pair = labels(direction);
+  const englishIsSource = direction !== "zh-en";
+  document.getElementById("pairTab").textContent = pair[0] + " → " + pair[1];
+  document.getElementById("sourcePane").hidden = tab !== "pair" && tab !== (englishIsSource ? "en" : "zh");
+  document.getElementById("targetPane").hidden = tab !== "pair" && tab !== (englishIsSource ? "zh" : "en");
+  document.body.className = scale + " view-" + tab;
+  for (const button of document.querySelectorAll(".tab")) {
+    button.classList.toggle("on", button.dataset.tab === tab);
+  }
+}
+
+const FOCUS_WINDOW_MS = 10000;
+const ENGLISH_SETTLE_MS = 500;
+
+function typeDelayMs(ch, backlog, english) {
+  const base = /\\s/.test(ch) ? 10 : ch.charCodeAt(0) < 128 ? 16 : 32;
+  if (english) return base;
+  const paced = backlog > 48 ? 4 : backlog > 24 ? Math.floor(base / 2) : base;
+  return Math.max(4, paced);
+}
+
+function commonPrefixLength(left, right) {
+  const limit = Math.min(left.length, right.length);
+  let i = 0;
+  while (i < limit && left[i] === right[i]) i++;
+  return i;
+}
+
+function integrateSpans(spans, next, nowMs) {
+  const current = spans.map((span) => span.text).join("");
+  if (next === current) return spans;
+  if (current && next.startsWith(current)) {
+    return spans.concat([{ text: next.slice(current.length), arrivedAtMs: nowMs }]);
+  }
+  const keep = commonPrefixLength(current, next);
+  const kept = [];
+  let consumed = 0;
+  for (const span of spans) {
+    if (consumed >= keep) break;
+    const end = consumed + span.text.length;
+    if (end <= keep) {
+      kept.push(span);
+      consumed = end;
+    } else {
+      kept.push({ text: span.text.slice(0, keep - consumed), arrivedAtMs: span.arrivedAtMs });
+      consumed = keep;
+    }
+  }
+  if (keep < next.length) kept.push({ text: next.slice(keep), arrivedAtMs: nowMs });
+  return kept;
+}
+
+function focusPieces(spans, revealed, nowMs) {
+  if (revealed <= 0) return [];
+  const out = [];
+  let seen = 0;
+  for (const span of spans) {
+    if (seen >= revealed) break;
+    const take = Math.min(span.text.length, revealed - seen);
+    if (take > 0) {
+      const focused = nowMs - span.arrivedAtMs <= FOCUS_WINDOW_MS;
+      const piece = span.text.slice(0, take);
+      const last = out[out.length - 1];
+      if (last && last.focused === focused) last.text += piece;
+      else out.push({ text: piece, focused });
+    }
+    seen += span.text.length;
+  }
+  return out;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function followUpdate(state, text, english, now) {
+  const next = text || "";
+  if (!state.primed) {
+    return {
+      spans: next ? [{ text: next, arrivedAtMs: now }] : [],
+      revealed: next.length,
+      primed: true,
+    };
+  }
+  const previous = state.spans.map((span) => span.text).join("");
+  if (next === previous) return state;
+  const prefix = commonPrefixLength(previous, next);
+  const spans = integrateSpans(state.spans, next, now);
+  let revealed = state.revealed;
+  if (english) {
+    revealed = Math.min(revealed, next.length);
+  } else {
+    if (prefix < revealed) revealed = prefix;
+    if (revealed > next.length) revealed = next.length;
+  }
+  return { spans: spans, revealed: revealed, primed: true };
+}
+
+function stableEnd(spans, now, english) {
+  const total = spans.reduce((count, span) => count + span.text.length, 0);
+  if (!english) return total;
+  let count = 0;
+  for (const span of spans) {
+    if (now - span.arrivedAtMs < ENGLISH_SETTLE_MS) break;
+    count += span.text.length;
+  }
+  return count;
+}
+
+function createFollow(el, isEnglish) {
+  let spans = [];
+  let revealed = 0;
+  let primed = false;
+  let typing = false;
+  let alive = true;
+  let signature = "";
+
+  function full() {
+    return spans.map((span) => span.text).join("");
+  }
+
+  function paint() {
+    const pieces = focusPieces(spans, revealed, Date.now());
+    const nextSig = pieces.map((piece) => (piece.focused ? "1" : "0") + piece.text).join("\u0000");
+    let caret = el.querySelector(":scope > .caret");
+    if (!caret) {
+      caret = document.createElement("span");
+      caret.className = "caret";
+      caret.setAttribute("aria-hidden", "true");
+      el.appendChild(caret);
+    }
+    if (nextSig === signature) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+    signature = nextSig;
+    const nodes = [...el.children].filter((node) => node !== caret);
+    const sameShape = nodes.length === pieces.length && nodes.every((node, i) => {
+      return node.className === (pieces[i].focused ? "focus" : "dim");
+    });
+    if (sameShape) {
+      pieces.forEach((piece, i) => {
+        if (nodes[i].textContent !== piece.text) nodes[i].textContent = piece.text;
+      });
+    } else {
+      for (const node of nodes) node.remove();
+      for (const piece of pieces) {
+        const span = document.createElement("span");
+        span.className = piece.focused ? "focus" : "dim";
+        span.textContent = piece.text;
+        el.insertBefore(span, caret);
+      }
+    }
+    if (nearBottom) el.scrollTop = el.scrollHeight;
+  }
+
+  function limitAt(now) {
+    return Math.min(full().length, stableEnd(spans, now, isEnglish()));
+  }
+
+  async function typeLoop() {
+    if (typing) return;
+    typing = true;
+    try {
+      while (alive) {
+        const text = full();
+        if (revealed >= limitAt(Date.now())) break;
+        const ch = text[revealed];
+        if (ch === undefined) break;
+        await sleep(typeDelayMs(ch, text.length - revealed, isEnglish()));
+        if (revealed >= limitAt(Date.now())) break;
+        revealed += 1;
+        paint();
+      }
+    } finally {
+      typing = false;
+      if (alive && revealed < limitAt(Date.now())) typeLoop();
+    }
+  }
+
+  function setText(next) {
+    const now = Date.now();
+    const state = followUpdate({ spans: spans, revealed: revealed, primed: primed }, next, isEnglish(), now);
+    spans = state.spans;
+    revealed = state.revealed;
+    primed = state.primed;
+    paint();
+    typeLoop();
+  }
+
+  function setLive(live) {
+    el.classList.toggle("settled", !live);
+  }
+
+  const timer = setInterval(() => {
+    if (!alive) return;
+    if (spans.length) paint();
+    if (revealed < limitAt(Date.now())) typeLoop();
+  }, 250);
+
+  return { setText: setText, setLive: setLive, stop() { alive = false; clearInterval(timer); } };
+}
+
+const sourceFollow = createFollow(document.getElementById("sourceText"), () => direction !== "zh-en");
+const targetFollow = createFollow(document.getElementById("targetText"), () => direction === "zh-en");
 
 function statusOf(state) {
   if (state.status) return state.status;
@@ -599,36 +1088,43 @@ function statusOf(state) {
   return "Listening";
 }
 
-function setText(el, text) {
-  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
-  el.textContent = text || "";
-  if (nearBottom) el.scrollTop = el.scrollHeight;
-}
-
 function apply(state) {
-  const pair = labels(state.direction);
-  document.getElementById("sourceLabel").textContent = pair[0];
-  document.getElementById("targetLabel").textContent = pair[1];
+  if (!state || state.phase === "idle") {
+    waiting();
+    return;
+  }
+  direction = state.direction || "en-zh";
+  scale = state.typeScale || "medium";
+  const pair = labels(direction);
   document.getElementById("sourceLang").textContent = pair[0];
   document.getElementById("targetLang").textContent = pair[1];
   const status = statusOf(state);
   document.getElementById("sourceStatus").textContent = status;
   document.getElementById("targetStatus").textContent = status;
-  document.getElementById("phase").textContent = state.phase === "idle" ? "这场已结束" : status;
-  document.body.className = (state.typeScale || "medium") + " " + (state.displayMode || "split");
-  setText(document.getElementById("sourceText"), state.sourceText);
-  setText(document.getElementById("targetText"), state.targetText);
+  document.getElementById("phase").textContent = status === "Listening to system" ? "" : status;
+  sourceFollow.setLive(true);
+  targetFollow.setLive(true);
+  sourceFollow.setText(state.sourceText);
+  targetFollow.setText(state.targetText);
+  showTab();
 }
 
 let events = null;
 
 function waiting() {
-  document.getElementById("phase").textContent = "等待这场开始";
+  document.getElementById("phase").textContent = "Waiting for this session to start";
+  document.getElementById("sourceStatus").textContent = "";
+  document.getElementById("targetStatus").textContent = "";
+  hideLock();
+  sourceFollow.setText("");
+  targetFollow.setText("");
+  sourceFollow.setLive(false);
+  targetFollow.setLive(false);
 }
 
 function showLock(wrong) {
   document.getElementById("lock").hidden = false;
-  document.getElementById("lockError").textContent = wrong ? "密码不对" : "";
+  document.getElementById("lockError").textContent = wrong ? "Wrong passcode" : "";
   document.getElementById("code").focus();
 }
 
@@ -654,14 +1150,24 @@ async function load() {
     return;
   }
   hideLock();
-  apply(await response.json());
+  const state = await response.json();
+  if (!state || state.phase === "idle") {
+    if (events) {
+      events.close();
+      events = null;
+    }
+    waiting();
+    setTimeout(load, 2000);
+    return;
+  }
+  apply(state);
   if (events) events.close();
   events = new EventSource("/sessions/" + room + "/events");
   events.addEventListener("state", (event) => apply(JSON.parse(event.data)));
   events.onerror = () => {
     if (events && events.readyState === EventSource.CLOSED) {
       events = null;
-      setTimeout(load, 2000);
+      load();
     }
   };
 }
@@ -686,6 +1192,13 @@ document.getElementById("lockForm").addEventListener("submit", async (event) => 
   }
   hideLock();
   load();
+});
+
+document.getElementById("tabs").addEventListener("click", (event) => {
+  const button = event.target.closest(".tab");
+  if (!button) return;
+  tab = button.dataset.tab;
+  showTab();
 });
 
 load();
