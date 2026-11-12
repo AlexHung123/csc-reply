@@ -25,7 +25,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 HOST = "0.0.0.0"
-PORT = 8091
+PORT = 8443
 ROOT = Path(__file__).resolve().parent
 LOGO_FILE = ROOT / "static" / "logo.svg"
 IDLE_KEEP_S = 10 * 60
